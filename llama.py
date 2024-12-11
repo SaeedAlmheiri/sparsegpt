@@ -1,5 +1,4 @@
 import time
-
 import torch
 import torch.nn as nn
 
@@ -13,6 +12,8 @@ try:
 except:
     has_wandb = False
 
+# Ensure we have a device defined
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def get_llama(model):
     import torch
@@ -22,7 +23,7 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', device_map = 'cuda')
+    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', device_map='cuda')
     model.seqlen = 2048
     return model
 
@@ -57,9 +58,13 @@ def llama_sequential(model, dataloader, dev):
             raise ValueError
 
     layers[0] = Catcher(layers[0])
+
+    # Provide position_ids for the top-level model call
     for batch in dataloader:
+        seq_len = batch[0].size(1)
+        position_ids = torch.arange(0, seq_len, dtype=torch.long, device=dev).unsqueeze(0)
         try:
-            model(batch[0].to(dev))
+            model(batch[0].to(dev), position_ids=position_ids)
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -75,6 +80,9 @@ def llama_sequential(model, dataloader, dev):
     print("Ready.")
 
     quantizers = {}
+    # position_ids for layer calls will match the model seqlen
+    position_ids = torch.arange(0, model.seqlen, dtype=torch.long, device=dev).unsqueeze(0)
+
     for i in range(len(layers)):
         layer = layers[i].to(dev)
         full = find_layers(layer)
@@ -108,14 +116,17 @@ def llama_sequential(model, dataloader, dev):
             def add_batch(name):
                 def tmp(_, inp, out):
                     gpts[name].add_batch(inp[0].data, out.data)
-
                 return tmp
 
             handles = []
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+                outs[j] = layer(
+                    inps[j].unsqueeze(0), 
+                    attention_mask=attention_mask, 
+                    position_ids=position_ids
+                )[0]
             for h in handles:
                 h.remove()
 
@@ -133,7 +144,11 @@ def llama_sequential(model, dataloader, dev):
                 gpts[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(
+                inps[j].unsqueeze(0), 
+                attention_mask=attention_mask, 
+                position_ids=position_ids
+            )[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -148,7 +163,7 @@ def llama_sequential(model, dataloader, dev):
 
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
+def llama_eval(model, testenc, dev, dataset: str, log_wandb: bool = False):
     print("Evaluating ...")
 
     testenc = testenc.input_ids
@@ -181,8 +196,9 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
         batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
+        position_ids = torch.arange(0, model.seqlen, dtype=torch.long, device=dev).unsqueeze(0)
         try:
-            model(batch)
+            model(batch, position_ids=position_ids)
         except ValueError:
             pass
     layers[0] = layers[0].module
@@ -193,6 +209,8 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
+
+    position_ids = torch.arange(0, model.seqlen, dtype=torch.long, device=dev).unsqueeze(0)
 
     for i in range(len(layers)):
         print(i)
@@ -208,7 +226,11 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
                 W.data[torch.abs(W.data) <= thresh] = 0
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(
+                inps[j].unsqueeze(0), 
+                attention_mask=attention_mask, 
+                position_ids=position_ids
+            )[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
