@@ -22,7 +22,7 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto')
+    model = AutoModelForCausalLM.from_pretrained(model, torch_dtype='auto', device="cuda:0")
     model.seqlen = 2048
     return model
 
